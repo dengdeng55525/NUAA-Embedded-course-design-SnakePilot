@@ -59,6 +59,7 @@ dkms.conf
 *.uvguix.*
 *.uvopt
 *.uvoptx
+!Project/Project.uvoptx
 
 # Keil/J-Link generated local state
 Project/Obj/

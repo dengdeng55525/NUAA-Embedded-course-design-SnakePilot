@@ -369,7 +369,7 @@
               <MiscControls></MiscControls>
               <Define>USE_STDPERIPH_DRIVER, STM32F10X_CL</Define>
               <Undefine></Undefine>
-              <IncludePath>..\Libraries\CMSIS\CoreSupport;..\Libraries\CMSIS\DeviceSupport;..\Libraries\CMSIS\DeviceSupport\Startup;..\Libraries\STM32F10x_StdPeriph_Driver_v3.5\inc;..\Libraries\STM32F10x_StdPeriph_Driver_v3.5\src;..\User\Main;..\User\Lcd;..\User\Timer;..\User\Uart</IncludePath>
+              <IncludePath>..\Libraries\CMSIS\CoreSupport;..\Libraries\CMSIS\DeviceSupport;..\Libraries\CMSIS\DeviceSupport\Startup;..\Libraries\STM32F10x_StdPeriph_Driver_v3.5\inc;..\Libraries\STM32F10x_StdPeriph_Driver_v3.5\src;..\User\Main;..\User\Battle;..\User\Lcd;..\User\Timer;..\User\Uart</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -426,6 +426,16 @@
               <FileName>hw_config.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\User\Main\hw_config.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>User/Battle</GroupName>
+          <Files>
+            <File>
+              <FileName>battle_core.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\Battle\battle_core.c</FilePath>
             </File>
           </Files>
         </Group>

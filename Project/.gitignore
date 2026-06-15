@@ -23,6 +23,7 @@
 /*.uvguix.*
 /*.uvopt
 /*.uvoptx
+!/Project.uvoptx
 /JLinkSettings.ini
 /JLink*.txt
 

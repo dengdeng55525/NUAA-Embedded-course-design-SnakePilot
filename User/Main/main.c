@@ -2,6 +2,7 @@
 #include "hw_config.h"
 #include "lcd.h"
 #include "snake_uart.h"
+#include "battle_core.h"
 
 #define GRID_COLS       15
 #define GRID_ROWS       20
@@ -9,6 +10,12 @@
 #define CELL_H          12
 #define BOARD_X         22
 #define BOARD_Y         72
+#define BATTLE_FRAME_MS_10FPS 100
+#define BATTLE_FRAME_MS_15FPS 66
+#define BATTLE_FRAME_MS_30FPS 33
+#define BATTLE_FRAME_MS_DEFAULT BATTLE_FRAME_MS_15FPS
+#define BATTLE_PAUSE_DEBOUNCE_MS 180
+#define BATTLE_INTERP_SCALE 16
 #define OPEN_DUO_ROWS   9
 #define OPEN_DUO_P1_Y   BOARD_Y
 #define OPEN_DUO_P2_Y   204
@@ -101,7 +108,8 @@
 #define GAME_MODE_DUO     2
 #define GAME_MODE_OPEN    3
 #define GAME_MODE_OPEN_DUO 4
-#define GAME_MODE_COUNT   5
+#define GAME_MODE_BATTLE  5
+#define GAME_MODE_COUNT   6
 #define RANKING_TOP_COUNT 5
 
 #define HOME_NAVY       0x000C
@@ -109,13 +117,19 @@
 #define HOME_PANEL      0x1084
 #define HOME_TEAL       0x05B8
 #define HOME_GOLD       0xFD20
+#define BATTLE_BG       0x0883
+#define BATTLE_PANEL    0x10C4
+#define BATTLE_GRID     0x1126
+#define BATTLE_TEXT     0xE7BF
+#define BATTLE_MUTED    0x8497
 
 #define KNOB_LEVEL_STEP (4096 / LEVEL_COUNT)
+#define KNOB_MODE_STEP  (4096 / GAME_MODE_COUNT)
 
 #define SNAKE_FLASH_PAGE_SIZE   0x800UL
 #define SNAKE_FLASH_STORE_ADDR  0x0803F800UL
 #define SNAKE_FLASH_MAGIC       0x534E4B50UL
-#define SNAKE_FLASH_VERSION     0x0002UL
+#define SNAKE_FLASH_VERSION     0x0003UL
 #define SNAKE_FLASH_XOR_KEY     0xA55A3CC3UL
 #define SNAKE_NO_INDEX          0xFFFFU
 #define SNAKE_FLASH_KEY1        0x45670123UL
@@ -147,6 +161,14 @@ typedef struct {
     u32 rankings[GAME_MODE_COUNT][RANKING_TOP_COUNT];
     u32 checksum;
 } SnakePersistRecord;
+
+typedef struct {
+    short x1;
+    short y1;
+    short x2;
+    short y2;
+    u8 valid;
+} BattleRenderBounds;
 
 static const MusicNote music_level1[] = {
     {NOTE_C4, 260}, {NOTE_E4, 180}, {NOTE_G4, 260}, {NOTE_C5, 380},
@@ -447,6 +469,20 @@ static u8 persist_dirty;
 static u8 force_board_clear;
 static const char *status_msg = "READY";
 static u16 ranking_scores[GAME_MODE_COUNT][RANKING_TOP_COUNT];
+static BattleState battle_state;
+static BattleInput battle_input;
+static u8 battle_view_x;
+static u8 battle_view_y;
+static u8 battle_skin = 1;
+static u16 battle_frame_ms = BATTLE_FRAME_MS_DEFAULT;
+static u16 battle_pause_cooldown_ms;
+static u8 battle_header_dirty = 1;
+static u8 battle_frame_led;
+static u8 battle_render_valid;
+static u8 battle_force_full_render;
+static u8 battle_render_view_x;
+static u8 battle_render_view_y;
+static BattleRenderBounds battle_prev_bounds[BATTLE_PLAYER_COUNT];
 
 static void Snake_AudioStop(void);
 static void Snake_AudioSet(u16 freq);
@@ -475,6 +511,9 @@ static void Snake_PersistLoad(void);
 static void Snake_PersistSave(void);
 static void Snake_Render(void);
 static void Snake_StartLevel(u8 lv);
+static void Snake_UpdateBest(void);
+static void Snake_BattleStart(void);
+static void Snake_BattleLoop(void);
 
 static u8 Snake_IsDuoMode(void)
 {
@@ -491,12 +530,18 @@ static u8 Snake_IsOpenDuoMode(void)
     return (u8)(game_mode == GAME_MODE_OPEN_DUO);
 }
 
+static u8 Snake_IsBattleMode(void)
+{
+    return (u8)(game_mode == GAME_MODE_BATTLE);
+}
+
 static const char *Snake_RankingModeText(u8 mode)
 {
     if (mode == GAME_MODE_CLASSIC) return "MODE CLASSIC";
     if (mode == GAME_MODE_DUO) return "MODE DUO";
     if (mode == GAME_MODE_OPEN) return "MODE OPEN";
     if (mode == GAME_MODE_OPEN_DUO) return "MODE OPENDUO";
+    if (mode == GAME_MODE_BATTLE) return "MODE BATTLE";
     return "MODE STAGE";
 }
 
@@ -520,6 +565,9 @@ static void Snake_RankingInsert(u8 mode, u16 score_value)
     if (mode >= GAME_MODE_COUNT || score_value == 0) {
         return;
     }
+    if (score_value > 999) {
+        score_value = 999;
+    }
 
     for (i = 0; i < RANKING_TOP_COUNT; i++) {
         if (score_value > ranking_scores[mode][i]) {
@@ -535,9 +583,10 @@ static void Snake_RankingInsert(u8 mode, u16 score_value)
 
 static void Snake_RecordModeResults(void)
 {
-    Snake_RankingInsert(game_mode, score);
     if (Snake_IsDuoMode()) {
-        Snake_RankingInsert(game_mode, score2);
+        Snake_RankingInsert(game_mode, (u16)(score + score2));
+    } else {
+        Snake_RankingInsert(game_mode, score);
     }
 }
 
@@ -885,6 +934,7 @@ static void Snake_TogglePause(void)
     if (paused) {
         Snake_DrawPauseHint();
     } else {
+        LCD_Fill(12, 148, LCD_W - 13, 186, BLACK);
         Snake_Render();
     }
     Snake_Beep(35);
@@ -982,8 +1032,10 @@ static u8 Snake_HandleHomeSerialInput(u8 *selected_level, u8 *selected_mode,
             should_start = 1;
         } else if (cmd.type == SNAKE_UART_CMD_PAUSE) {
             *open_settings = 1;
-        } else if (cmd.type == SNAKE_UART_CMD_UP ||
-                   cmd.type == SNAKE_UART_CMD_DOWN) {
+        } else if (cmd.type == SNAKE_UART_CMD_UP) {
+            *selected_mode = (u8)((*selected_mode == 0) ?
+                (GAME_MODE_COUNT - 1) : (*selected_mode - 1));
+        } else if (cmd.type == SNAKE_UART_CMD_DOWN) {
             *selected_mode = (u8)((*selected_mode + 1) % GAME_MODE_COUNT);
         }
     }
@@ -1564,6 +1616,8 @@ static void Snake_DrawHomeMode(u8 selected_mode)
         Snake_ShowText(39, 244, 12, "MODE OPEN", WHITE, HOME_PANEL, 1);
     } else if (selected_mode == GAME_MODE_OPEN_DUO) {
         Snake_ShowText(25, 244, 12, "MODE OPENDUO", WHITE, HOME_PANEL, 1);
+    } else if (selected_mode == GAME_MODE_BATTLE) {
+        Snake_ShowText(31, 244, 12, "MODE BATTLE", WHITE, HOME_PANEL, 1);
     } else {
         Snake_ShowText(37, 244, 12, "MODE STAGE", WHITE, HOME_PANEL, 1);
     }
@@ -2025,10 +2079,11 @@ static void Snake_DrawRankingScreen(u8 selected_mode, short snake_x)
     Snake_ShowTextCenter(44, 12, Snake_RankingModeText(selected_mode),
                          CYAN, HOME_NAVY, 1);
 
-    Snake_DrawHomeSnake(snake_x, 0, snake_x);
-    Snake_ShowTextCenter(286, 12, "KNOB MODE  R/ANY KEY BACK",
-                         LGRAY, BLACK, 1);
     Snake_DrawRankingTable(selected_mode);
+    LCD_Fill(0, 294, LCD_W - 1, LCD_H - 1, BLACK);
+    Snake_ShowTextCenter(300, 12, "KNOB MODE  R/ANY KEY BACK",
+                         LGRAY, BLACK, 1);
+    Snake_DrawHomeSnake(snake_x, 0, snake_x);
 }
 
 static void Snake_ShowRanking(void)
@@ -2060,7 +2115,7 @@ static void Snake_ShowRanking(void)
         knob_value = Snake_KnobRead();
         if ((u16)(knob_value + KNOB_TURN_DELTA) < last_knob_value ||
             knob_value > (u16)(last_knob_value + KNOB_TURN_DELTA)) {
-            selected_mode = (u8)(knob_value / KNOB_LEVEL_STEP);
+            selected_mode = (u8)(knob_value / KNOB_MODE_STEP);
             if (selected_mode >= GAME_MODE_COUNT) {
                 selected_mode = GAME_MODE_COUNT - 1;
             }
@@ -2797,6 +2852,12 @@ static void Snake_StartLevel(u8 lv)
 {
     level_index = lv;
     level_score = 0;
+    if (Snake_IsBattleMode()) {
+        time_left = 0;
+        classic_target_len = 0;
+        Snake_BattleStart();
+        return;
+    }
     time_left = (game_mode == GAME_MODE_CLASSIC || Snake_IsOpenMode()) ?
                 0 : level_time_limit[level_index];
     classic_target_len = Snake_CountWalkableCells();
@@ -2864,6 +2925,934 @@ static u8 Snake_PopDirectionKey(void)
     }
 
     return key;
+}
+
+static BattleDir Snake_BattleFromSnakeDir(SnakeDir d)
+{
+    if (d == DIR_UP) return BATTLE_DIR_UP;
+    if (d == DIR_DOWN) return BATTLE_DIR_DOWN;
+    if (d == DIR_LEFT) return BATTLE_DIR_LEFT;
+    return BATTLE_DIR_RIGHT;
+}
+
+static void Snake_BattleSetInputDir(u8 player, BattleDir d)
+{
+    if (player >= BATTLE_PLAYER_COUNT) {
+        return;
+    }
+    battle_input.set_dir[player] = 1;
+    battle_input.dir[player] = d;
+}
+
+static void Snake_BattleUpdateViewport(void)
+{
+    const BattleSnake *player = &battle_state.snakes[0];
+    short vx;
+    short vy;
+    const short left_margin = 4;
+    const short right_margin = GRID_COLS - 5;
+    const short top_margin = 5;
+    const short bottom_margin = GRID_ROWS - 6;
+
+    if (!player->alive || player->len == 0) {
+        return;
+    }
+
+    vx = battle_view_x;
+    vy = battle_view_y;
+
+    if ((short)player->x[0] < vx + left_margin) {
+        vx = (short)player->x[0] - left_margin;
+    } else if ((short)player->x[0] > vx + right_margin) {
+        vx = (short)player->x[0] - right_margin;
+    }
+
+    if ((short)player->y[0] < vy + top_margin) {
+        vy = (short)player->y[0] - top_margin;
+    } else if ((short)player->y[0] > vy + bottom_margin) {
+        vy = (short)player->y[0] - bottom_margin;
+    }
+
+    if (vx < 0) vx = 0;
+    if (vy < 0) vy = 0;
+    if (vx > BATTLE_WORLD_COLS - GRID_COLS) {
+        vx = BATTLE_WORLD_COLS - GRID_COLS;
+    }
+    if (vy > BATTLE_WORLD_ROWS - GRID_ROWS) {
+        vy = BATTLE_WORLD_ROWS - GRID_ROWS;
+    }
+
+    battle_view_x = (u8)vx;
+    battle_view_y = (u8)vy;
+    viewport_x = battle_view_x;
+    viewport_y = battle_view_y;
+}
+
+static u8 Snake_BattleWorldToView(u8 x, u8 y, u8 *vx, u8 *vy)
+{
+    if (x < battle_view_x || y < battle_view_y) {
+        return 0;
+    }
+    x = (u8)(x - battle_view_x);
+    y = (u8)(y - battle_view_y);
+    if (x >= GRID_COLS || y >= GRID_ROWS) {
+        return 0;
+    }
+    *vx = x;
+    *vy = y;
+    return 1;
+}
+
+static u8 Snake_BattleFps(void)
+{
+    if (battle_frame_ms <= BATTLE_FRAME_MS_30FPS) return 30;
+    if (battle_frame_ms <= BATTLE_FRAME_MS_15FPS) return 15;
+    return 10;
+}
+
+static void Snake_BattleSetFrameMs(u16 frame_ms)
+{
+    battle_frame_ms = frame_ms;
+    battle_header_dirty = 1;
+    if (frame_ms == BATTLE_FRAME_MS_30FPS) {
+        Snake_SetStatus("FPS 30");
+    } else if (frame_ms == BATTLE_FRAME_MS_15FPS) {
+        Snake_SetStatus("FPS 15");
+    } else {
+        Snake_SetStatus("FPS 10");
+    }
+}
+
+static void Snake_BattleFillBoardRect(short x1, short y1,
+                                      short x2, short y2, u16 color)
+{
+    short bx1 = BOARD_X + 1;
+    short by1 = BOARD_Y + 1;
+    short bx2 = BOARD_X + GRID_COLS * CELL_W - 2;
+    short by2 = BOARD_Y + GRID_ROWS * CELL_H - 2;
+
+    if (x1 > x2 || y1 > y2) {
+        return;
+    }
+    if (x2 < bx1 || y2 < by1 || x1 > bx2 || y1 > by2) {
+        return;
+    }
+    if (x1 < bx1) x1 = bx1;
+    if (y1 < by1) y1 = by1;
+    if (x2 > bx2) x2 = bx2;
+    if (y2 > by2) y2 = by2;
+
+    LCD_Fill((u16)x1, (u16)y1, (u16)x2, (u16)y2, color);
+}
+
+static void Snake_BattleDrawSpotAt(short px, short py, u16 color, u8 inset)
+{
+    u8 r;
+
+    r = (CELL_H / 2 > inset) ? (u8)(CELL_H / 2 - inset) : 1;
+    if (r > 5) {
+        r = 5;
+    }
+    if (px - r < BOARD_X + 1 || py - r < BOARD_Y + 1 ||
+        px + r > BOARD_X + GRID_COLS * CELL_W - 2 ||
+        py + r > BOARD_Y + GRID_ROWS * CELL_H - 2) {
+        return;
+    }
+    gui_circle(px, py, color, r, 1);
+}
+
+static void Snake_BattleDrawDotRadius(short px, short py, u16 color, u8 radius)
+{
+    if (px - radius < BOARD_X + 1 || py - radius < BOARD_Y + 1 ||
+        px + radius > BOARD_X + GRID_COLS * CELL_W - 2 ||
+        py + radius > BOARD_Y + GRID_ROWS * CELL_H - 2) {
+        return;
+    }
+    gui_circle(px, py, color, radius, 1);
+}
+
+static void Snake_BattleDrawSpot(u8 vx, u8 vy, u16 color, u8 inset)
+{
+    short px = (short)(BOARD_X + (u16)vx * CELL_W + CELL_W / 2);
+    short py = (short)(BOARD_Y + (u16)vy * CELL_H + CELL_H / 2);
+
+    Snake_BattleDrawSpotAt(px, py, color, inset);
+}
+
+static u16 Snake_BattlePelletColor(const BattlePellet *pellet)
+{
+    static const u16 colors[6] = {
+        RED, YELLOW, GREEN, CYAN, MAGENTA, BRRED
+    };
+
+    if (pellet->type == BATTLE_PELLET_CORPSE) {
+        return HOME_GOLD;
+    }
+    return colors[pellet->color % 6];
+}
+
+static u16 Snake_BattleSnakeBodyColor(u8 player)
+{
+    static const u16 colors[BATTLE_PLAYER_COUNT] = {
+        GREEN, CYAN, BROWN, MAGENTA, BRRED
+    };
+    return colors[player % BATTLE_PLAYER_COUNT];
+}
+
+static u16 Snake_BattleSnakeShadowColor(u8 player)
+{
+    static const u16 colors[BATTLE_PLAYER_COUNT] = {
+        HOME_TEAL, GRAYBLUE, BROWN, DARKBLUE, RED
+    };
+    return colors[player % BATTLE_PLAYER_COUNT];
+}
+
+static u16 Snake_BattleSnakeHeadColor(u8 player)
+{
+    static const u16 colors[BATTLE_PLAYER_COUNT] = {
+        YELLOW, MAGENTA, HOME_GOLD, LIGHTBLUE, RED
+    };
+    return colors[player % BATTLE_PLAYER_COUNT];
+}
+
+static u8 Snake_BattleNailStage(u16 len)
+{
+    if (len < 12) return 0;
+    if (len < 24) return 1;
+    if (len < 45) return 2;
+    return 3;
+}
+
+static void Snake_BattleDrawNailHeadAt(short px, short py, u16 len)
+{
+    u8 stage = Snake_BattleNailStage(len);
+    u16 body = (stage < 2) ? YELLOW : HOME_GOLD;
+    u8 r = (u8)(4 + stage);
+
+    if (px - r < BOARD_X + 1 || py - r < BOARD_Y + 1 ||
+        px + r > BOARD_X + GRID_COLS * CELL_W - 2 ||
+        py + r > BOARD_Y + GRID_ROWS * CELL_H - 2) {
+        return;
+    }
+    gui_circle(px, py, body, r, 1);
+    gui_circle(px - 3, py - 2, GREEN, 1, 1);
+    gui_circle(px + 3, py - 2, GREEN, 1, 1);
+    Snake_BattleFillBoardRect((short)(px - 5), (short)(py + 2),
+                              (short)(px - 3), (short)(py + 4), BRRED);
+    Snake_BattleFillBoardRect((short)(px + 3), (short)(py + 2),
+                              (short)(px + 5), (short)(py + 4), BRRED);
+    if (stage == 0) {
+        Snake_BattleFillBoardRect((short)(px - 4), (short)(py - r - 1),
+                                  (short)(px - 3), (short)(py - r), WHITE);
+        Snake_BattleFillBoardRect((short)(px + 3), (short)(py - r - 1),
+                                  (short)(px + 4), (short)(py - r), WHITE);
+    } else {
+        Snake_BattleFillBoardRect((short)(px - 5), (short)(py - r - 2),
+                                  (short)(px - 3), (short)(py - r), WHITE);
+        Snake_BattleFillBoardRect((short)(px + 3), (short)(py - r - 2),
+                                  (short)(px + 5), (short)(py - r), WHITE);
+    }
+    if (stage >= 2) {
+        Snake_BattleFillBoardRect((short)(px - 1), (short)(py - r - 3),
+                                  (short)(px + 1), (short)(py - r - 1),
+                                  BRRED);
+    }
+}
+
+static void Snake_BattleAdvanceCell(BattleDir dir, short *x, short *y)
+{
+    if (dir == BATTLE_DIR_UP) (*y)--;
+    else if (dir == BATTLE_DIR_DOWN) (*y)++;
+    else if (dir == BATTLE_DIR_LEFT) (*x)--;
+    else (*x)++;
+}
+
+static u16 Snake_BattleStepInterval(const BattleSnake *snake)
+{
+    return snake->boost_on ? BATTLE_BOOST_STEP_MS : BATTLE_NORMAL_STEP_MS;
+}
+
+static u8 Snake_BattleInterpAlpha(const BattleSnake *snake)
+{
+    u16 interval = Snake_BattleStepInterval(snake);
+    u32 alpha;
+
+    if (interval == 0) {
+        return 0;
+    }
+    alpha = ((u32)snake->move_acc_ms * BATTLE_INTERP_SCALE) / interval;
+    if (alpha > BATTLE_INTERP_SCALE) {
+        alpha = BATTLE_INTERP_SCALE;
+    }
+    return (u8)alpha;
+}
+
+static u8 Snake_BattleInterpolatedCenter(const BattleSnake *snake, u16 index,
+                                         short *px, short *py)
+{
+    short sx;
+    short sy;
+    short tx;
+    short ty;
+    short dx;
+    short dy;
+    u8 alpha;
+
+    if (index >= snake->len) {
+        return 0;
+    }
+
+    sx = snake->x[index];
+    sy = snake->y[index];
+    tx = sx;
+    ty = sy;
+
+    if (index == 0) {
+        tx = sx;
+        ty = sy;
+        Snake_BattleAdvanceCell(snake->next_dir, &tx, &ty);
+    } else {
+        tx = snake->x[index - 1];
+        ty = snake->y[index - 1];
+    }
+
+    dx = (short)(tx - sx);
+    dy = (short)(ty - sy);
+    alpha = Snake_BattleInterpAlpha(snake);
+
+    *px = (short)(BOARD_X +
+                  ((sx - (short)battle_view_x) * CELL_W) +
+                  CELL_W / 2 +
+                  (dx * CELL_W * alpha) / BATTLE_INTERP_SCALE);
+    *py = (short)(BOARD_Y +
+                  ((sy - (short)battle_view_y) * CELL_H) +
+                  CELL_H / 2 +
+                  (dy * CELL_H * alpha) / BATTLE_INTERP_SCALE);
+
+    if (*px < BOARD_X - CELL_W || *py < BOARD_Y - CELL_H ||
+        *px > BOARD_X + GRID_COLS * CELL_W + CELL_W ||
+        *py > BOARD_Y + GRID_ROWS * CELL_H + CELL_H) {
+        return 0;
+    }
+    return 1;
+}
+
+static void Snake_BattleDrawLinkAt(short px1, short py1, short px2, short py2,
+                                   u16 color, u8 radius)
+{
+    short dx = (short)(px2 - px1);
+    short dy = (short)(py2 - py1);
+    short adx = dx < 0 ? (short)-dx : dx;
+    short ady = dy < 0 ? (short)-dy : dy;
+    short left = px1 < px2 ? px1 : px2;
+    short right = px1 > px2 ? px1 : px2;
+    short top = py1 < py2 ? py1 : py2;
+    short bottom = py1 > py2 ? py1 : py2;
+    short steps;
+    short i;
+    short px;
+    short py;
+
+    if (adx > 1 && ady > 1) {
+        steps = (short)(((adx > ady ? adx : ady) / 4) + 1);
+        for (i = 0; i <= steps; i++) {
+            px = (short)(px1 + (dx * i) / steps);
+            py = (short)(py1 + (dy * i) / steps);
+            Snake_BattleDrawDotRadius(px, py, color, radius);
+        }
+        return;
+    }
+
+    Snake_BattleFillBoardRect((short)(left - radius), (short)(top - radius),
+                              (short)(right + radius), (short)(bottom + radius),
+                              color);
+}
+
+static void Snake_BattleDrawSnakeCell(u8 player, u16 index)
+{
+    const BattleSnake *snake = &battle_state.snakes[player];
+    u8 inset;
+    u16 body_color;
+    u16 shadow_color;
+    short px;
+    short py;
+    short prev_px;
+    short prev_py;
+
+    if (!Snake_BattleInterpolatedCenter(snake, index, &px, &py)) {
+        return;
+    }
+
+    if (player == 0 && battle_skin != 0) {
+        body_color = (Snake_BattleNailStage(snake->len) >= 2) ? HOME_GOLD : YELLOW;
+        shadow_color = BROWN;
+        if (index > 0 &&
+            Snake_BattleInterpolatedCenter(snake, (u16)(index - 1),
+                                           &prev_px, &prev_py)) {
+            Snake_BattleDrawLinkAt(px, py, prev_px, prev_py, shadow_color, 4);
+            Snake_BattleDrawLinkAt(px, py, prev_px, prev_py, body_color, 3);
+            Snake_BattleDrawLinkAt(px, py, prev_px, prev_py, WHITE, 1);
+        }
+        if (index == 0) {
+            Snake_BattleDrawNailHeadAt(px, py, snake->len);
+        } else {
+            inset = (u8)(Snake_BattleNailStage(snake->len) >= 2 ? 2 : 3);
+            Snake_BattleDrawSpotAt(px, py, body_color, inset);
+            if ((index % 3) == 0) {
+                Snake_BattleDrawSpotAt(px, py, WHITE, 5);
+            }
+        }
+        return;
+    }
+
+    body_color = Snake_BattleSnakeBodyColor(player);
+    shadow_color = Snake_BattleSnakeShadowColor(player);
+    if (index > 0 &&
+        Snake_BattleInterpolatedCenter(snake, (u16)(index - 1),
+                                       &prev_px, &prev_py)) {
+        Snake_BattleDrawLinkAt(px, py, prev_px, prev_py, shadow_color, 4);
+        Snake_BattleDrawLinkAt(px, py, prev_px, prev_py, body_color, 3);
+    }
+
+    Snake_BattleDrawSpotAt(px, py,
+                           index == 0 ? Snake_BattleSnakeHeadColor(player) :
+                                        body_color,
+                           index == 0 ? 2 : 3);
+}
+
+static void Snake_BattleBoundsReset(BattleRenderBounds *bounds)
+{
+    bounds->x1 = 32767;
+    bounds->y1 = 32767;
+    bounds->x2 = -32768;
+    bounds->y2 = -32768;
+    bounds->valid = 0;
+}
+
+static void Snake_BattleBoundsInclude(BattleRenderBounds *bounds,
+                                      short px, short py, u8 radius)
+{
+    short x1 = (short)(px - radius);
+    short y1 = (short)(py - radius);
+    short x2 = (short)(px + radius);
+    short y2 = (short)(py + radius);
+
+    if (!bounds->valid) {
+        bounds->x1 = x1;
+        bounds->y1 = y1;
+        bounds->x2 = x2;
+        bounds->y2 = y2;
+        bounds->valid = 1;
+        return;
+    }
+
+    if (x1 < bounds->x1) bounds->x1 = x1;
+    if (y1 < bounds->y1) bounds->y1 = y1;
+    if (x2 > bounds->x2) bounds->x2 = x2;
+    if (y2 > bounds->y2) bounds->y2 = y2;
+}
+
+static void Snake_BattleSnakeBounds(u8 player, BattleRenderBounds *bounds)
+{
+    const BattleSnake *snake = &battle_state.snakes[player];
+    u16 i;
+    u16 tail_start;
+    short px;
+    short py;
+
+    Snake_BattleBoundsReset(bounds);
+    if (!snake->alive) {
+        return;
+    }
+
+    tail_start = (snake->len > 5) ? (u16)(snake->len - 5) : 0;
+    for (i = 0; i < snake->len; i++) {
+        if (i >= 5 && i < tail_start) {
+            continue;
+        }
+        if (Snake_BattleInterpolatedCenter(snake, i, &px, &py)) {
+            Snake_BattleBoundsInclude(bounds, px, py, 14);
+        }
+    }
+}
+
+static void Snake_BattleClearBounds(const BattleRenderBounds *bounds)
+{
+    if (!bounds->valid) {
+        return;
+    }
+    Snake_BattleFillBoardRect(bounds->x1, bounds->y1,
+                              bounds->x2, bounds->y2, BATTLE_BG);
+}
+
+static void Snake_BattleDrawPellets(void)
+{
+    u16 i;
+    u8 vx;
+    u8 vy;
+
+    for (i = 0; i < BATTLE_MAX_PELLETS; i++) {
+        const BattlePellet *pellet = &battle_state.pellets[i];
+        if (!pellet->active) {
+            continue;
+        }
+        if (Snake_BattleWorldToView(pellet->x, pellet->y, &vx, &vy)) {
+            Snake_BattleDrawSpot(vx, vy, Snake_BattlePelletColor(pellet),
+                                 pellet->type == BATTLE_PELLET_CORPSE ? 3 : 4);
+        }
+    }
+}
+
+static void Snake_BattleDrawSnakes(void)
+{
+    u16 i;
+    u8 player;
+
+    for (player = BATTLE_PLAYER_COUNT; player > 0; player--) {
+        const BattleSnake *snake = &battle_state.snakes[player - 1];
+        if (!snake->alive) {
+            continue;
+        }
+        for (i = snake->len; i > 0; i--) {
+            Snake_BattleDrawSnakeCell((u8)(player - 1), (u16)(i - 1));
+        }
+    }
+}
+
+static void Snake_BattleDrawWorldBoundary(void)
+{
+    short x;
+    short y;
+
+    if (battle_view_x == 0) {
+        Snake_BattleFillBoardRect(BOARD_X + 1, BOARD_Y + 1,
+                                  BOARD_X + 3,
+                                  BOARD_Y + GRID_ROWS * CELL_H - 2,
+                                  HOME_GOLD);
+    }
+    if ((u16)battle_view_x + GRID_COLS >= BATTLE_WORLD_COLS) {
+        x = (short)(BOARD_X +
+                    ((BATTLE_WORLD_COLS - battle_view_x) * CELL_W) - 2);
+        Snake_BattleFillBoardRect(x, BOARD_Y + 1,
+                                  (short)(x + 2),
+                                  BOARD_Y + GRID_ROWS * CELL_H - 2,
+                                  HOME_GOLD);
+    }
+    if (battle_view_y == 0) {
+        Snake_BattleFillBoardRect(BOARD_X + 1, BOARD_Y + 1,
+                                  BOARD_X + GRID_COLS * CELL_W - 2,
+                                  BOARD_Y + 3,
+                                  HOME_GOLD);
+    }
+    if ((u16)battle_view_y + GRID_ROWS >= BATTLE_WORLD_ROWS) {
+        y = (short)(BOARD_Y +
+                    ((BATTLE_WORLD_ROWS - battle_view_y) * CELL_H) - 2);
+        Snake_BattleFillBoardRect(BOARD_X + 1, y,
+                                  BOARD_X + GRID_COLS * CELL_W - 2,
+                                  (short)(y + 2),
+                                  HOME_GOLD);
+    }
+}
+
+static void Snake_BattleSaveBounds(BattleRenderBounds *bounds)
+{
+    u8 player;
+
+    for (player = 0; player < BATTLE_PLAYER_COUNT; player++) {
+        battle_prev_bounds[player] = bounds[player];
+    }
+    battle_render_view_x = battle_view_x;
+    battle_render_view_y = battle_view_y;
+    battle_render_valid = 1;
+}
+
+static void Snake_BattleDrawHeader(void)
+{
+    static u16 last_score = 0xffff;
+    static u16 last_len = 0xffff;
+    static u16 last_ai_score = 0xffff;
+    static u8 last_skin = 0xff;
+    static u8 last_fps = 0xff;
+    static const char *last_status;
+    u16 ai_score = 0;
+    u8 fps;
+    u8 i;
+
+    for (i = 1; i < BATTLE_PLAYER_COUNT; i++) {
+        ai_score = (u16)(ai_score + battle_state.snakes[i].score);
+    }
+    fps = Snake_BattleFps();
+
+    if (!battle_header_dirty &&
+        last_score == battle_state.snakes[0].score &&
+        last_len == battle_state.snakes[0].len &&
+        last_ai_score == ai_score &&
+        last_skin == battle_skin &&
+        last_fps == fps &&
+        last_status == status_msg) {
+        return;
+    }
+
+    LCD_Fill(0, 0, LCD_W - 1, BOARD_Y - 8, BATTLE_PANEL);
+    POINT_COLOR = BATTLE_TEXT;
+    BACK_COLOR = BATTLE_PANEL;
+    LCD_ShowString(6, 4, 16, (u8 *)"Battle", 0);
+    LCD_ShowString(82, 4, 16, (u8 *)(battle_skin ? "NAIL" : "CLSC"), 0);
+    LCD_ShowString(6, 24, 16, (u8 *)"P:", 0);
+    LCD_ShowNum(30, 24, battle_state.snakes[0].score, 3, 16);
+    LCD_ShowString(74, 24, 16, (u8 *)"L:", 0);
+    LCD_ShowNum(98, 24, battle_state.snakes[0].len, 3, 16);
+    LCD_ShowString(142, 24, 16, (u8 *)"AI:", 0);
+    LCD_ShowNum(176, 24, ai_score, 3, 16);
+    LCD_ShowString(206, 24, 16, (u8 *)"F", 0);
+    LCD_ShowNum(218, 24, fps, 2, 16);
+    LCD_ShowString(6, 48, 16, (u8 *)status_msg, 0);
+    last_score = battle_state.snakes[0].score;
+    last_len = battle_state.snakes[0].len;
+    last_ai_score = ai_score;
+    last_skin = battle_skin;
+    last_fps = fps;
+    last_status = status_msg;
+    battle_header_dirty = 0;
+}
+
+static void Snake_BattleRender(void)
+{
+    u8 player;
+    BattleRenderBounds current_bounds[BATTLE_PLAYER_COUNT];
+
+    Snake_BattleUpdateViewport();
+    Snake_BattleDrawHeader();
+
+    for (player = 0; player < BATTLE_PLAYER_COUNT; player++) {
+        Snake_BattleSnakeBounds(player, &current_bounds[player]);
+    }
+
+    if (!battle_render_valid || battle_force_full_render ||
+        battle_render_view_x != battle_view_x ||
+        battle_render_view_y != battle_view_y) {
+        LCD_Fill(BOARD_X, BOARD_Y, BOARD_X + GRID_COLS * CELL_W - 1,
+                 BOARD_Y + GRID_ROWS * CELL_H - 1, BATTLE_BG);
+        Snake_BattleDrawPellets();
+        Snake_BattleDrawSnakes();
+        Snake_BattleDrawWorldBoundary();
+        POINT_COLOR = BATTLE_GRID;
+        LCD_DrawRectangle(BOARD_X - 1, BOARD_Y - 1,
+                          BOARD_X + GRID_COLS * CELL_W,
+                          BOARD_Y + GRID_ROWS * CELL_H);
+        Snake_BattleSaveBounds(current_bounds);
+        battle_force_full_render = 0;
+        return;
+    }
+
+    for (player = 0; player < BATTLE_PLAYER_COUNT; player++) {
+        Snake_BattleClearBounds(&battle_prev_bounds[player]);
+        Snake_BattleClearBounds(&current_bounds[player]);
+    }
+
+    Snake_BattleDrawPellets();
+    Snake_BattleDrawSnakes();
+    Snake_BattleDrawWorldBoundary();
+
+    POINT_COLOR = BATTLE_GRID;
+    LCD_DrawRectangle(BOARD_X - 1, BOARD_Y - 1,
+                      BOARD_X + GRID_COLS * CELL_W,
+                      BOARD_Y + GRID_ROWS * CELL_H);
+    Snake_BattleSaveBounds(current_bounds);
+}
+
+static void Snake_BattleDrawPauseOverlay(void)
+{
+    LCD_Fill(32, 132, LCD_W - 33, 196, BATTLE_PANEL);
+    POINT_COLOR = CYAN;
+    LCD_DrawRectangle(32, 132, LCD_W - 33, 196);
+    Snake_ShowTextCenter(144, 16, "PAUSED", BATTLE_TEXT, BATTLE_PANEL, 0);
+    Snake_ShowTextCenter(166, 16, "P/SPACE resume", BATTLE_MUTED, BATTLE_PANEL, 0);
+    Snake_ShowTextCenter(184, 16, "KEY1 or R home", BATTLE_MUTED, BATTLE_PANEL, 0);
+}
+
+static void Snake_BattleTogglePause(void)
+{
+    paused = (u8)!paused;
+    pause_lock = 1;
+    battle_pause_cooldown_ms = BATTLE_PAUSE_DEBOUNCE_MS;
+    battle_header_dirty = 1;
+    Snake_SetStatus(paused ? "PAUSED" : "RUNNING");
+    if (paused) {
+        Snake_AudioStop();
+        Snake_BattleDrawHeader();
+        Snake_BattleDrawPauseOverlay();
+    }
+}
+
+static u8 Snake_BattleCellHitsOther(u8 self, u8 x, u8 y)
+{
+    u8 player;
+    u16 i;
+
+    for (player = 0; player < BATTLE_PLAYER_COUNT; player++) {
+        const BattleSnake *snake = &battle_state.snakes[player];
+        if (player == self || !snake->alive) {
+            continue;
+        }
+        for (i = 0; i < snake->len; i++) {
+            if (snake->x[i] == x && snake->y[i] == y) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void Snake_BattleAdvance(BattleDir dir, short *x, short *y)
+{
+    if (dir == BATTLE_DIR_UP) (*y)--;
+    else if (dir == BATTLE_DIR_DOWN) (*y)++;
+    else if (dir == BATTLE_DIR_LEFT) (*x)--;
+    else (*x)++;
+}
+
+static int Snake_BattleAiScore(u8 player, BattleDir dir, u8 tx, u8 ty)
+{
+    const BattleSnake *snake = &battle_state.snakes[player];
+    short nx = snake->x[0];
+    short ny = snake->y[0];
+    int dist;
+    int wall;
+
+    if (Battle_IsReverse(snake->dir, dir)) {
+        return -30000;
+    }
+    Snake_BattleAdvance(dir, &nx, &ny);
+    if (nx < 0 || ny < 0 || nx >= BATTLE_WORLD_COLS || ny >= BATTLE_WORLD_ROWS) {
+        return -30000;
+    }
+    if (Snake_BattleCellHitsOther(player, (u8)nx, (u8)ny)) {
+        return -20000;
+    }
+    dist = (tx > nx ? tx - nx : nx - tx) + (ty > ny ? ty - ny : ny - ty);
+    wall = nx;
+    if (ny < wall) wall = ny;
+    if ((BATTLE_WORLD_COLS - 1 - nx) < wall) wall = BATTLE_WORLD_COLS - 1 - nx;
+    if ((BATTLE_WORLD_ROWS - 1 - ny) < wall) wall = BATTLE_WORLD_ROWS - 1 - ny;
+    return wall * 2 - dist * 8;
+}
+
+static void Snake_BattleUpdateAi(BattleInput *input)
+{
+    u8 player;
+    u8 i;
+    BattleDir dir;
+
+    for (player = 1; player < BATTLE_PLAYER_COUNT; player++) {
+        BattleSnake *snake = &battle_state.snakes[player];
+        u8 tx = BATTLE_WORLD_COLS / 2;
+        u8 ty = BATTLE_WORLD_ROWS / 2;
+        int best_target = -30000;
+        int best_score = -30000;
+        BattleDir best_dir = snake->dir;
+
+        if (!snake->alive || snake->len == 0) {
+            continue;
+        }
+        for (i = 0; i < BATTLE_MAX_PELLETS; i++) {
+            const BattlePellet *pellet = &battle_state.pellets[i];
+            int dist;
+            int score;
+            if (!pellet->active) {
+                continue;
+            }
+            dist = (pellet->x > snake->x[0] ? pellet->x - snake->x[0] :
+                    snake->x[0] - pellet->x) +
+                   (pellet->y > snake->y[0] ? pellet->y - snake->y[0] :
+                    snake->y[0] - pellet->y);
+            score = pellet->value * 20 - dist;
+            if (score > best_target) {
+                best_target = score;
+                tx = pellet->x;
+                ty = pellet->y;
+            }
+        }
+        for (dir = BATTLE_DIR_UP; dir <= BATTLE_DIR_RIGHT; dir++) {
+            int score = Snake_BattleAiScore(player, dir, tx, ty);
+            if (score > best_score) {
+                best_score = score;
+                best_dir = dir;
+            }
+        }
+        input->set_dir[player] = 1;
+        input->dir[player] = best_dir;
+        input->boost[player] = (u8)(snake->len > 16 && best_target < -10);
+    }
+}
+
+static void Snake_BattleHandleSerial(void)
+{
+    SnakeUartCmd cmd;
+    SnakeDir want;
+
+    while (SnakeUart_PopCommand(&cmd)) {
+        if (cmd.type == SNAKE_UART_CMD_RESET) {
+            return_home_request = 1;
+        } else if (cmd.type == SNAKE_UART_CMD_PAUSE ||
+                   cmd.type == SNAKE_UART_CMD_START) {
+            if (battle_pause_cooldown_ms == 0) {
+                Snake_BattleTogglePause();
+            }
+        } else if (cmd.type == SNAKE_UART_CMD_LEVEL) {
+            if (cmd.value == 0) {
+                Snake_BattleSetFrameMs(BATTLE_FRAME_MS_10FPS);
+            } else if (cmd.value == 1) {
+                Snake_BattleSetFrameMs(BATTLE_FRAME_MS_15FPS);
+            } else if (cmd.value == 2) {
+                Snake_BattleSetFrameMs(BATTLE_FRAME_MS_30FPS);
+            } else if (cmd.value == 3) {
+                battle_skin = 0;
+                battle_header_dirty = 1;
+                battle_force_full_render = 1;
+                Snake_SetStatus("CLASSIC SKIN");
+            } else if (cmd.value == 4) {
+                battle_skin = 1;
+                battle_header_dirty = 1;
+                battle_force_full_render = 1;
+                Snake_SetStatus("NAIL SKIN");
+            }
+        } else if (Snake_CommandToDir(cmd.type, &want)) {
+            Snake_BattleSetInputDir(0, Snake_BattleFromSnakeDir(want));
+        }
+    }
+}
+
+static void Snake_BattleHandleInput(BattleInput *input)
+{
+    u8 key;
+    u8 knob_event;
+    SnakeDir want;
+
+    Snake_BattleHandleSerial();
+    Snake_KeyScan();
+    Snake_KnobScan();
+    knob_event = Snake_KnobPopEvent();
+
+    if (paused && (key_press_latch & KEY_UP_MASK)) {
+        key_press_latch &= (u8)(~KEY_UP_MASK);
+        return_home_request = 1;
+        Snake_SetStatus("EXIT HOME");
+        battle_header_dirty = 1;
+        return;
+    }
+
+    if ((key_stable & KEY_PAUSE_MASK) == KEY_PAUSE_MASK) {
+        if (!pause_lock) {
+            Snake_BattleTogglePause();
+        }
+        return;
+    }
+    pause_lock = 0;
+
+    if (paused) {
+        return;
+    }
+
+    if ((key_stable & (KEY_LEFT_MASK | KEY_RIGHT_MASK)) ==
+        (KEY_LEFT_MASK | KEY_RIGHT_MASK)) {
+        input->boost[0] = 1;
+        key_press_latch &= (u8)(~(KEY_LEFT_MASK | KEY_RIGHT_MASK));
+        return;
+    }
+
+    if (knob_event != 0) {
+        BattleDir base = battle_state.snakes[0].next_dir;
+        if (knob_event == KNOB_LEFT_EVENT) {
+            if (base == BATTLE_DIR_UP) base = BATTLE_DIR_LEFT;
+            else if (base == BATTLE_DIR_DOWN) base = BATTLE_DIR_RIGHT;
+            else if (base == BATTLE_DIR_LEFT) base = BATTLE_DIR_DOWN;
+            else base = BATTLE_DIR_UP;
+        } else {
+            if (base == BATTLE_DIR_UP) base = BATTLE_DIR_RIGHT;
+            else if (base == BATTLE_DIR_DOWN) base = BATTLE_DIR_LEFT;
+            else if (base == BATTLE_DIR_LEFT) base = BATTLE_DIR_UP;
+            else base = BATTLE_DIR_DOWN;
+        }
+        Snake_BattleSetInputDir(0, base);
+        return;
+    }
+
+    key = Snake_PopDirectionKey();
+    if (key != 0) {
+        want = Snake_KeyToDir(key);
+        Snake_BattleSetInputDir(0, Snake_BattleFromSnakeDir(want));
+    }
+}
+
+static void Snake_BattleStart(void)
+{
+    Battle_Init(&battle_state, rng_state ^ GPIO_ReadInputData(GPIOA));
+    Battle_ResetInput(&battle_input);
+    battle_view_x = 0;
+    battle_view_y = 0;
+    battle_frame_ms = BATTLE_FRAME_MS_DEFAULT;
+    battle_pause_cooldown_ms = 0;
+    battle_header_dirty = 1;
+    battle_frame_led = 0;
+    battle_render_valid = 0;
+    battle_force_full_render = 1;
+    paused = 0;
+    pause_lock = 0;
+    restart_request = 0;
+    return_home_request = 0;
+    Snake_KeyReset();
+    Snake_KnobReset();
+    Snake_SetStatus("BATTLE AIx4");
+    LCD_Clear(BLACK);
+    Snake_BattleRender();
+}
+
+static void Snake_BattleLoop(void)
+{
+    while (Snake_IsBattleMode()) {
+        Battle_ResetInput(&battle_input);
+        Snake_BattleHandleInput(&battle_input);
+
+        if (return_home_request) {
+            score = battle_state.snakes[0].score;
+            Snake_UpdateBest();
+            Snake_RecordModeResults();
+            Snake_PersistSave();
+            return_home_request = 0;
+            LCD_Clear(BLACK);
+            Snake_ShowHome();
+            return;
+        }
+        if (restart_request) {
+            restart_request = 0;
+            Snake_BattleStart();
+            continue;
+        }
+        if (!paused) {
+            Snake_BattleUpdateAi(&battle_input);
+            Battle_Update(&battle_state, &battle_input, battle_frame_ms);
+            if (battle_state.last_events &
+                (BATTLE_EVENT_DEATH_P1 | BATTLE_EVENT_DEATH_P2 |
+                 BATTLE_EVENT_RESPAWN_P1 | BATTLE_EVENT_RESPAWN_P2 |
+                 BATTLE_EVENT_MATCH_END)) {
+                battle_force_full_render = 1;
+            }
+            score = battle_state.snakes[0].score;
+            score2 = 0;
+            Snake_UpdateBest();
+            Snake_BattleRender();
+            battle_frame_led = (u8)!battle_frame_led;
+            LED5(battle_frame_led);
+        }
+        Delay_ms(battle_frame_ms);
+        if (battle_pause_cooldown_ms > battle_frame_ms) {
+            battle_pause_cooldown_ms = (u16)(battle_pause_cooldown_ms -
+                                             battle_frame_ms);
+        } else {
+            battle_pause_cooldown_ms = 0;
+        }
+    }
 }
 
 static void Snake_HandleInput(void)
@@ -3410,6 +4399,12 @@ int main(void)
     while (1) {
         if (restart_request) {
             restart_request = 0;
+            Snake_StartGame();
+            continue;
+        }
+
+        if (Snake_IsBattleMode()) {
+            Snake_BattleLoop();
             Snake_StartGame();
             continue;
         }

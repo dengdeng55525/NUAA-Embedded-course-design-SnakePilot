@@ -17,6 +17,10 @@ virtualFolder:
             - path: ../User/Main/stm32f10x_it.c
             - path: ../User/Main/hw_config.c
           folders: []
+        - name: Battle
+          files:
+            - path: ../User/Battle/battle_core.c
+          folders: []
     - name: Libraries
       files: []
       folders:
@@ -71,6 +75,7 @@ targets:
         - ../Libraries/STM32F10x_StdPeriph_Driver_v3.5/inc
         - ../Libraries/STM32F10x_StdPeriph_Driver_v3.5/src
         - ../User/Main
+        - ../User/Battle
         - ../User/Lcd
         - ../User/Timer
         - ../User/Uart
