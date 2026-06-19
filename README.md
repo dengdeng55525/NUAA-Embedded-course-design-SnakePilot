@@ -1,14 +1,10 @@
-# SnakePilot
+# SnakePilot：基于 STM32 的多模式智能贪吃蛇嵌入式交互系统
+<p align="center">
+  <img src="logo.png" alt="SnakePilot Logo" width="250" />
+</p>
 SnakePilot 是一个基于 STM32F107VC 的嵌入式贪吃蛇交互系统。项目围绕 NUAA_CM3_107 实验开发板完成，集成 LCD 图形界面、GPIO 按键、ADC 旋钮、USART1 串口键盘、片内 Flash 数据保存、DAC/DMA/TIM 音频、LED 状态提示，以及多关卡、多模式、开放地图、双人对战和 Battle AI 竞技玩法。
-<p align="center">
-  <img src="logo.png" alt="SnakePilot Logo" width="350" />
-</p>
 
-
-工程使用 STM32F10x 标准外设库 V3.5.0，提供 Keil MDK-ARM 工程、VS Code EIDE 工程配置和 PC 端 Battle 可视化仿真器。固件主体已完成并可直接编译、下载到开发板运行。
-<p align="center">
-  <img src="NUAA_STM.JPG" alt="NUAA_CM3_107" width="350" />
-</p>
+本工程使用 STM32F10x 标准外设库 V3.5.0，提供 Keil MDK-ARM 工程、VS Code EIDE 工程配置和 PC 端 Battle 可视化仿真器。固件主体已完成并可直接编译、下载到开发板运行。
 
 ## 作者
 
